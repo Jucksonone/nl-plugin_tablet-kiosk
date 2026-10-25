@@ -1,11 +1,9 @@
-"""Backend tests without a database: the routes and the Agent tool with a fake platform and connection.
+"""Backend routes without a database: token, validation and refusals that need no SQL.
 
-The SQL itself runs in tests/test_platform.py, on the temporary platform of `nl-plugin verify`.
+The SQL runs in tests/test_platform.py, on the temporary platform of `nl-plugin verify`.
 """
 
 from __future__ import annotations
-
-from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,57 +16,30 @@ TOKEN = "t" * 32
 AUTH = {"authorization": f"Bearer {TOKEN}"}
 
 
-class FakeConn:
-    def __init__(self, rows):
-        self.rows, self.sql = rows, []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def execute(self, sql, params=None):
-        self.sql.append((sql, params))
-        return self
-
-    def fetchall(self):
-        return self.rows
-
-    def fetchone(self):
-        return (7,)
-
-
-class FakePlatform:
-    def experiment(self, experiment_id):
-        return {"id": experiment_id, "project_id": 1, "name": "e"} if experiment_id == 1 else None
-
-
 @pytest.fixture
-def client(monkeypatch):
-    monkeypatch.setattr(plugin, "_settings", Settings(id="tablet_kiosk", token=TOKEN, port=1))
-    monkeypatch.setattr(type(plugin), "platform", property(lambda self: FakePlatform()))
-    conn = FakeConn([("hello", "alice", datetime(2026, 10, 22, tzinfo=timezone.utc))])
-    monkeypatch.setattr(plugin, "connect", lambda: conn)
-    yield TestClient(plugin.app), conn
+def http(monkeypatch, tmp_path):
+    monkeypatch.setattr(plugin, "_settings", Settings(id="tablet_kiosk", token=TOKEN, port=1, data_dir=tmp_path))
+    return TestClient(plugin.app)   # no `with`: the lifespan (controller threads) does not start
 
 
-def test_routes_need_the_token_and_check_the_experiment(client):
-    http, _ = client
-    assert http.get("/experiments/1/notes").status_code == 401
-    assert http.get("/experiments/2/notes", headers=AUTH).status_code == 404
+def test_routes_need_the_token(http):
+    assert http.get("/status").status_code == 401
+    body = http.get("/status", headers=AUTH).json()
+    assert body["online"] is False and body["configured"] is False
 
 
-def test_adding_a_note_records_the_user(client):
-    http, conn = client
-    response = http.post("/experiments/1/notes", json={"text": "fed at 9"}, headers={**AUTH, "x-nl-user": "alice"})
-    assert response.status_code == 201 and response.json() == {"id": 7}
-    assert conn.sql[-1][1] == [1, "fed at 9", "alice"]
+def test_controls_are_validated_before_the_tablet_is_asked(http):
+    r = http.post("/control", json={"cmd": "reboot", "params": {}}, headers=AUTH)
+    assert r.status_code == 422
+    r = http.post("/capture/start", json={"duration_s": 0}, headers=AUTH)
+    assert r.status_code == 422
 
 
-def test_the_agent_tool_stays_in_the_project(client):
-    http, _ = client
-    call = lambda project, args: http.post("/agent/tools/notes_of_experiment", json={"project_id": project, "args": args}, headers=AUTH).json()
-    assert call(1, {"experiment_id": 1})["data"]["notes"][0]["text"] == "hello"
-    assert call(2, {"experiment_id": 1})["error"]["code"] == "not_found"
-    assert call(1, {"experiment_id": 0})["error"]["code"] == "invalid_arguments"
+def test_uploads_only_take_media_types(http):
+    r = http.post("/media/uploads", json={"filename": "notes.exe", "size": 10}, headers=AUTH)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "unsupported_type"
+
+
+def test_capture_files_reject_odd_names(http):
+    assert http.get("/captures/a/files/..%2Fsecret", headers=AUTH).status_code == 404
+    assert http.get("/captures/..%2Fx/files/a.mp4", headers=AUTH).status_code == 404

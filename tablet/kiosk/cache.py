@@ -1,75 +1,82 @@
-"""Download playlist media into a local, content-addressed cache."""
+"""Content-addressed media cache: the plugin pushes files here before showing them.
+
+A file is named ``<sha256>.<ext>``; a pushed file is kept only if its content
+matches the name.
+"""
 
 import hashlib
 import logging
 import os
+import re
 import threading
 import time
-import urllib.request
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+MEDIA_NAME = re.compile(r"^[0-9a-f]{64}\.[a-z0-9]{1,8}$")
+
+
+class MissingMedia(Exception):
+    def __init__(self, names: list[str]):
+        super().__init__(f"media not on the tablet: {', '.join(names)}")
+        self.names = names
+
 
 class MediaCache:
-    def __init__(self, root: Path, max_bytes: int, server_url: str = ""):
+    def __init__(self, root: Path, max_bytes: int):
         self.root = root
-        self.server_url = server_url.rstrip("/")   # base for relative manifest URLs
         self.max_bytes = max_bytes
         self.lock = threading.Lock()
-        self.pending = 0
 
-    def path_for(self, item: dict) -> Path:
-        return self.root / item["name"]
+    def path_for(self, name: str) -> Path:
+        if not MEDIA_NAME.match(name):
+            raise ValueError(f"bad media name: {name}")
+        return self.root / name
 
-    def is_ready(self, item: dict) -> bool:
-        p = self.path_for(item)
-        return p.is_file() and p.stat().st_size == item["size"]
+    def files(self) -> list[dict]:
+        return [{"name": p.name, "size": p.stat().st_size}
+                for p in sorted(self.root.iterdir()) if p.is_file() and MEDIA_NAME.match(p.name)]
 
-    def ensure(self, items: list[dict]) -> list[Path]:
-        """Download every missing item; returns local paths in playlist order.
-
-        Raises on the first item that cannot be fetched or fails verification.
-        """
-        missing = [it for it in items if not self.is_ready(it)]
-        with self.lock:
-            self.pending = len(missing)
-        for it in missing:
-            self._download(it)
-            with self.lock:
-                self.pending -= 1
-        paths = [self.path_for(it) for it in items]
+    def ensure(self, names: list[str]) -> list[Path]:
+        """Local paths in playlist order; raises MissingMedia if any is not here."""
+        paths = [self.path_for(n) for n in names]
+        missing = [p.name for p in paths if not p.is_file()]
+        if missing:
+            raise MissingMedia(missing)
         now = time.time()
         for p in paths:
             os.utime(p, (now, now))   # mtime doubles as "last used" for eviction
-        self.evict(keep={p.name for p in paths})
         return paths
 
-    def _download(self, item: dict) -> None:
-        dest = self.path_for(item)
-        part = dest.with_name(dest.name + ".part")
-        offset = part.stat().st_size if part.exists() else 0
-        url = item["url"]
-        if url.startswith("/"):
-            url = self.server_url + url
-        req = urllib.request.Request(url)
-        if offset:
-            req.add_header("Range", f"bytes={offset}-")
-        log.info("downloading %s (%d bytes, resume at %d)", item["name"], item["size"], offset)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            if offset and resp.status != 206:
-                offset = 0          # server ignored the Range header; start over
-            with part.open("ab" if offset else "wb") as out:
-                while chunk := resp.read(1 << 20):
-                    out.write(chunk)
+    def put(self, name: str, stream, size: int, keep: set[str] = frozenset()) -> int:
+        """Store ``size`` bytes from ``stream`` as ``name`` after checking the hash."""
+        dest = self.path_for(name)
+        part = dest.with_name(f".{name}.part")
         digest = hashlib.sha256()
-        with part.open("rb") as f:
-            while chunk := f.read(1 << 20):
+        left = size
+        with part.open("wb") as out:
+            while left > 0:
+                chunk = stream.read(min(left, 1 << 20))
+                if not chunk:
+                    break
                 digest.update(chunk)
-        if digest.hexdigest() != item["sha256"]:
-            part.unlink()
-            raise ValueError(f"sha256 mismatch for {item['name']}")
-        part.replace(dest)
+                out.write(chunk)
+                left -= len(chunk)
+        if left or digest.hexdigest() != name.split(".", 1)[0]:
+            part.unlink(missing_ok=True)
+            raise ValueError(f"content of {name} does not match its name" if not left else f"{name}: body ended early")
+        with self.lock:
+            part.replace(dest)
+            self.evict(keep=set(keep) | {name})
+        return size
+
+    def delete(self, name: str) -> bool:
+        p = self.path_for(name)
+        if p.is_file():
+            p.unlink()
+            return True
+        return False
 
     def usage(self) -> int:
         return sum(p.stat().st_size for p in self.root.iterdir() if p.is_file())

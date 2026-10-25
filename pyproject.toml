@@ -1,9 +1,9 @@
 [project]
 name = "nl-plugin-tablet_kiosk"
 version = "0.1.0"
-description = "Natural Land plugin: Tablet kiosk"
+description = "Natural Land plugin: Tablet kiosk (stimulus screen, camera, microphones and touch of a Linux tablet)"
 requires-python = ">=3.11,<3.12"
-dependencies = ["natural-land-plugin-sdk"]
+dependencies = ["natural-land-plugin-sdk", "httpx>=0.27"]
 
 [project.scripts]
 # Started by the platform (plugin.json backend.command); main() migrates, then serves.

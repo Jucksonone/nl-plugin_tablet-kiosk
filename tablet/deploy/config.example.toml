@@ -1,10 +1,12 @@
-# ~/.config/kiosk/config.toml — every key is optional; defaults are in kiosk/config.py
-server_url = "http://192.168.31.215:8000"
-token = "change-me"
+# ~/.config/kiosk/config.toml — every key except token is optional; defaults are in kiosk/config.py
+# The Natural Land plugin "平板终端" connects to this tablet. Copy the token from the
+# plugin's settings page (系统设置 → 平板终端 → 设置); at least 16 characters.
+token = "change-me-to-the-plugin-token"
+# listen_host = "0.0.0.0"
+# listen_port = 8770
 # device_id = "tablet-01"        # defaults to the hostname
 
-# cache_max_bytes = 21474836480  # 20 GiB
-# keep_uploaded = false          # delete local capture files after upload
+# cache_max_bytes = 21474836480  # 20 GiB of stimulus media
 
 # Capture (camera supports 640x480, 800x600, 1280x720, 1280x960, 1600x900, ...)
 # width = 640

@@ -1,5 +1,5 @@
 [Unit]
-Description=Tablet kiosk agent (player, capture, cloud commands)
+Description=Tablet kiosk agent (player, capture; driven by the Natural Land plugin)
 After=pipewire.service wireplumber.service
 
 [Service]
@@ -9,3 +9,5 @@ WorkingDirectory=%h/kiosk/device
 ExecStart=/usr/bin/python3 -m kiosk
 Restart=always
 RestartSec=5
+# Stopping finalises the running capture's last segment.
+TimeoutStopSec=30

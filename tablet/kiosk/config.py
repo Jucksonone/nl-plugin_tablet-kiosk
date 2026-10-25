@@ -1,24 +1,30 @@
+import logging
 import os
 import socket
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 CONFIG_PATH = Path(os.environ.get("KIOSK_CONFIG", Path.home() / ".config/kiosk/config.toml"))
 STATE_DIR = Path.home() / ".local/share/kiosk"
+# Keys of the standalone version (the tablet connected to a server); ignored now.
+LEGACY_KEYS = {"server_url", "status_interval"}
 
 
 @dataclass
 class Config:
-    server_url: str = "http://127.0.0.1:8000"
+    # The Natural Land plugin connects to this address; every request needs the token.
+    listen_host: str = "0.0.0.0"
+    listen_port: int = 8770
     token: str = ""
     device_id: str = field(default_factory=socket.gethostname)
-    status_interval: float = 15.0
 
     media_dir: Path = STATE_DIR / "media"
     spool_dir: Path = STATE_DIR / "spool"
     cache_max_bytes: int = 20 * 1024**3
-    keep_uploaded: bool = False
+    event_keep: int = 5000           # events kept on disk for the plugin to fetch
 
     # player
     mpv_audio_device: str = "pipewire/echo-cancel-sink"
@@ -57,12 +63,16 @@ def load() -> Config:
         with CONFIG_PATH.open("rb") as f:
             data = tomllib.load(f)
         for key, value in data.items():
+            if key in LEGACY_KEYS:
+                log.warning("config key %r is no longer used (the plugin connects to the tablet)", key)
+                continue
             if not hasattr(cfg, key):
                 raise ValueError(f"unknown config key: {key}")
             if isinstance(getattr(cfg, key), Path):
                 value = Path(value).expanduser()
             setattr(cfg, key, value)
-    cfg.server_url = cfg.server_url.rstrip("/")
+    if len(cfg.token) < 16:
+        raise ValueError(f"set a token of at least 16 characters in {CONFIG_PATH} (the plugin's settings page shows it)")
     cfg.media_dir.mkdir(parents=True, exist_ok=True)
     cfg.spool_dir.mkdir(parents=True, exist_ok=True)
     return cfg

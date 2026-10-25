@@ -1,61 +1,59 @@
-"""Device agent: one WebSocket to the server, commands in, acks/status/events out."""
+"""Device agent: the plugin's HTTP interface in, the player / capture / touch on the tablet.
 
-import asyncio
-import json
+The Natural Land plugin connects to the tablet (server.py). A capture the plugin
+starts carries a lease: the plugin renews it every few seconds, and when it
+stops renewing (plugin stopped, host down, network gone) the tablet stops the
+capture by itself and puts back what the capture changed.
+"""
+
 import logging
 import os
 import secrets
 import subprocess
 import threading
 import time
-import urllib.parse
-
-import websockets
 
 from . import system
 from .cache import MediaCache
 from .config import STATE_DIR, Config
+from .events import EventLog
 from .player import Player
-from .uploader import Uploader
+from .spool import SAFE_NAME, Spool
 
 log = logging.getLogger(__name__)
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+MAX_DURATION_S = 24 * 3600
+ENSURE_PLAYER_EVERY_S = 5.0
 
 
 class Agent:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, player=None, state_dir=STATE_DIR):
         self.cfg = cfg
-        self.loop: asyncio.AbstractEventLoop | None = None
-        self.outbox: asyncio.Queue | None = None
-        self.status_now: asyncio.Event | None = None   # set to push a status report early
-        self.cache = MediaCache(cfg.media_dir, cfg.cache_max_bytes, cfg.server_url)
-        self.player = Player(cfg, STATE_DIR)
-        self.uploader = Uploader(cfg, self.emit)
+        self.events = EventLog(state_dir, cfg.event_keep)
+        self.cache = MediaCache(cfg.media_dir, cfg.cache_max_bytes)
+        self.spool = Spool(cfg.spool_dir)
+        self.player = player or Player(cfg, state_dir)
         self.capture_lock = threading.Lock()
         self.capture = None            # dict with session objects while running
-        self.playlist_job: threading.Thread | None = None
+        self.stop_event = threading.Event()
 
     # ------------------------------------------------------------ outbound
 
     def emit(self, name: str, **data) -> None:
-        """Thread-safe: queue an event for the server."""
-        msg = {"type": "event", "name": name, "t": time.time(), **data}
-        log.info("event %s %s", name, data)
-        if self.loop and self.outbox:
-            self.loop.call_soon_threadsafe(self._queue_out, msg)
-            if name.startswith("capture_"):
-                self.push_status()
+        """Thread-safe: record an event for the plugin."""
+        self.events.append(name, **data)
 
-    def push_status(self) -> None:
-        """Thread-safe: send a status report now instead of at the next interval."""
-        if self.loop and self.status_now:
-            self.loop.call_soon_threadsafe(self.status_now.set)
+    def active_session(self) -> str | None:
+        with self.capture_lock:
+            return self.capture["id"] if self.capture else None
 
-    def _queue_out(self, msg: dict) -> None:
-        if self.outbox.full():
-            self.outbox.get_nowait()        # drop the oldest while offline
-        self.outbox.put_nowait(msg)
+    def media_in_use(self) -> set[str]:
+        names = {p.name for p in self.player.playlist}
+        with self.capture_lock:
+            if self.capture and self.capture["screen"]:
+                names |= set(_names(self.capture["screen"].get("items")))
+        return names
 
     def status(self) -> dict:
         with self.capture_lock:
@@ -63,107 +61,113 @@ class Agent:
             if self.capture:
                 s = self.capture
                 cap = {"session": s["id"], "started": s["started"], "until": s["until"],
+                       "lease_until": s["lease_until"], "video": s["flags"]["video"],
+                       "audio": s["flags"]["audio"], "touch": s["flags"]["touch"],
                        "exposure": s["av"].ae.last if s["av"] and s["av"].ae else None}
         return {
+            "device_id": self.cfg.device_id,
             "version": VERSION,
+            "time": time.time(),
+            "instance": self.events.instance,
+            "last_seq": self.events.seq,
             "uptime": system.uptime(),
             "volume": system.get_volume(),
             "brightness": self.player.brightness(),
             "player": self.player.status(),
             "cache_bytes": self.cache.usage(),
-            "cache_pending": self.cache.pending,
             "capture": cap,
-            "upload_pending": self.uploader.pending(),
+            "spool": self.spool.usage(),
             "battery": system.battery(),
             "temperature": system.soc_temperature(),
             "memory": {**system.memory(),
                        "agent_rss_mb": system.process_rss_mb(os.getpid()),
-                       "mpv_rss_mb": system.process_rss_mb(self.player.proc.pid if self.player.proc else None)},
+                       "mpv_rss_mb": system.process_rss_mb(self.player.proc.pid if getattr(self.player, "proc", None) else None)},
             "load": system.load_average(),
         }
 
     # ------------------------------------------------------------ commands
 
     def handle(self, cmd: str, params: dict):
-        """Runs in a worker thread; returns the ack result or raises."""
+        """Runs in an HTTP worker thread; returns the result or raises."""
         if cmd == "ping":
             return {"pong": time.time()}
         if cmd == "get_status":
             return self.status()
         if cmd == "set_volume":
-            return {"volume": system.set_volume(params["value"])}
+            value = system.set_volume(params["value"])
+            self.emit("volume_set", value=value)
+            return {"volume": value}
         if cmd == "set_brightness":
-            return {"brightness": self.player.set_brightness(params["value"])}
+            value = self.player.set_brightness(params["value"])
+            self.emit("brightness_set", value=value)
+            return {"brightness": value}
         if cmd == "set_screen":
             self.player.set_mode(params["mode"])
+            self.emit("screen_set", mode=self.player.mode)
             return {"mode": self.player.mode}
         if cmd == "player":
             self.player.control(params["action"])
             return self.player.status()
-        if cmd == "set_playlist":
-            return self._set_playlist(params)
         if cmd == "show":
-            return self._show(params)
+            result = self._show(params)
+            self.emit("shown", **result)
+            return result
         if cmd == "capture_start":
             return self._capture_start(params)
+        if cmd == "capture_renew":
+            return self._capture_renew(params)
         if cmd == "capture_stop":
-            return self._capture_stop(reason="command")
+            return self._capture_stop(reason=params.get("reason") or "command", session=params.get("session"))
         raise ValueError(f"unknown command: {cmd}")
 
-    def _set_playlist(self, params: dict) -> dict:
-        items = params.get("items", [])
-        missing = sum(not self.cache.is_ready(it) for it in items)
-
-        def job():
-            try:
-                paths = self.cache.ensure(items)
-                self.player.set_playlist(paths, params.get("loop", True),
-                                         float(params.get("image_duration", 10.0)))
-                self.emit("playlist_ready", items=len(paths))
-            except Exception as e:
-                log.exception("playlist failed")
-                self.emit("playlist_failed", error=str(e))
-
-        self.playlist_job = threading.Thread(target=job, name="playlist", daemon=True)
-        self.playlist_job.start()
-        return {"accepted": True, "items": len(items), "to_download": missing}
-
     def _show(self, screen: dict) -> dict:
-        """Put a mode (and optionally media) on screen; downloads first, so it can be slow."""
+        """Put a mode (and optionally media already pushed to the tablet) on screen."""
         mode = screen.get("mode", "content")
-        items = screen.get("items")
-        if items:
-            paths = self.cache.ensure(items)
+        names = _names(screen.get("items"))
+        if names:
+            paths = self.cache.ensure(names)
             self.player.show(mode, paths, screen.get("loop", True),
                              float(screen.get("image_duration", 10.0)))
         else:
             self.player.show(mode)
-        return {"mode": self.player.mode, "items": [p["name"] for p in items or []]}
+        return {"mode": self.player.mode, "items": names}
 
     def _capture_start(self, params: dict) -> dict:
         from .capture import CaptureSession
         from .touch import TouchRecorder
 
         duration = float(params.get("duration_s", 60))
-        if not 1 <= duration <= 6 * 3600:
-            raise ValueError("duration_s must be between 1 and 21600")
+        if not 1 <= duration <= MAX_DURATION_S:
+            raise ValueError(f"duration_s must be between 1 and {MAX_DURATION_S}")
+        lease = params.get("lease_s")
+        if lease is not None and not 5 <= float(lease) <= 600:
+            raise ValueError("lease_s must be between 5 and 600")
         video = bool(params.get("video", True))
         audio = bool(params.get("audio", True))
         touch = bool(params.get("touch", True))
         sid = params.get("session_id") or time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
+        if not SAFE_NAME.match(sid):
+            raise ValueError(f"bad session id: {sid}")
+        if (self.cfg.spool_dir / sid).exists():
+            raise ValueError(f"session {sid} already exists on the tablet")
         screen = params.get("screen")              # None = leave the screen as it is
         volume = params.get("volume")              # None = leave as is, else 0..1
         brightness = params.get("brightness")
         restore = bool(params.get("restore", True))
+        if screen and _names(screen.get("items")):
+            self.cache.ensure(_names(screen.get("items")))   # fail before touching anything
 
         with self.capture_lock:
             if self.capture:
                 raise RuntimeError(f"capture already running: {self.capture['id']}")
+            now = time.time()
             self.capture = cap = {
-                "id": sid, "started": time.time(), "until": time.time() + duration,
-                "av": None, "touch": None, "timer": None, "screen": screen,
+                "id": sid, "started": now, "until": now + duration,
+                "lease_until": now + float(lease) if lease is not None else None,
+                "flags": {"video": video, "audio": audio, "touch": touch},
+                "av": None, "touch": None, "screen": screen, "meta": params.get("meta") or {},
                 "screen_log": [], "playback": [], "restore": {}, "settings": {},
-                "stop_sampling": threading.Event()}
+                "stop_sampling": threading.Event(), "stopping": False}
         screen_log = cap["screen_log"]
 
         def log_screen(event: dict) -> None:
@@ -192,37 +196,49 @@ class Agent:
             mode = self.player.mode
             if mode != "content":
                 first_file = None
-            elif screen and screen.get("items"):
-                first_file = screen["items"][0]["name"]   # mpv may not have reported it yet
+            elif screen and _names(screen.get("items")):
+                first_file = _names(screen["items"])[0]   # mpv may not have reported it yet
             else:
                 first_file = self.player.display_name(self.player.current)
             log_screen({"t": time.time(), "mode": mode, "file": first_file})
 
+            (self.cfg.spool_dir / sid).mkdir(parents=True, exist_ok=True)
             av = None
             if video or audio:
-                av = CaptureSession(self.cfg, sid, video, audio, self.uploader.enqueue, self.emit)
+                av = CaptureSession(self.cfg, sid, video, audio, lambda _path: None, self.emit)
                 av.start()
             tr = None
             if touch:
-                (self.cfg.spool_dir / sid).mkdir(parents=True, exist_ok=True)
-                tr = TouchRecorder(self.cfg, self.cfg.spool_dir / sid, self.uploader.enqueue)
+                tr = TouchRecorder(self.cfg, self.cfg.spool_dir / sid, lambda _path: None)
                 tr.start()
         except Exception:
             with self.capture_lock:
                 self.capture = None
             self._undo_capture_settings(cap)
+            _remove_if_empty(self.cfg.spool_dir / sid)
             raise
 
         threading.Thread(target=self._sample_playback, args=(cap,), name="playback-sampler",
                          daemon=True).start()
-        timer = threading.Timer(duration, self._capture_stop, kwargs={"reason": "duration"})
-        timer.daemon = True
         with self.capture_lock:
-            cap.update(av=av, touch=tr, timer=timer, started=time.time(), until=time.time() + duration)
-        timer.start()
-        self.emit("capture_started", session=sid, duration_s=duration,
+            now = time.time()
+            cap.update(av=av, touch=tr, started=now, until=now + duration)
+            if lease is not None:
+                cap["lease_until"] = now + float(lease)
+        self.emit("capture_started", session=sid, duration_s=duration, lease_s=lease,
                   video=video, audio=audio, touch=touch)
-        return {"session": sid, "duration_s": duration}
+        return {"session": sid, "duration_s": duration, "until": cap["until"], "lease_until": cap["lease_until"]}
+
+    def _capture_renew(self, params: dict) -> dict:
+        lease = float(params.get("lease_s", 30))
+        if not 5 <= lease <= 600:
+            raise ValueError("lease_s must be between 5 and 600")
+        with self.capture_lock:
+            cap = self.capture
+            if not cap or cap["id"] != params.get("session") or cap["stopping"]:
+                raise RuntimeError(f"capture {params.get('session')} is not running")
+            cap["lease_until"] = time.time() + lease
+            return {"session": cap["id"], "lease_until": cap["lease_until"], "until": cap["until"]}
 
     def _sample_playback(self, cap: dict) -> None:
         """Once a second, pair wall-clock time with the stimulus video position.
@@ -239,7 +255,7 @@ class Agent:
 
     def _undo_capture_settings(self, cap: dict) -> None:
         cap["stop_sampling"].set()
-        if cap["log_fn"] in self.player.listeners:
+        if cap.get("log_fn") in self.player.listeners:
             self.player.listeners.remove(cap["log_fn"])
         undo = cap["restore"]
         try:
@@ -252,108 +268,93 @@ class Agent:
         except Exception:
             log.exception("restoring settings after capture failed")
 
-    def _capture_stop(self, reason: str) -> dict:
+    def _capture_stop(self, reason: str, session: str | None = None) -> dict:
         with self.capture_lock:
-            cap, self.capture = self.capture, None
-        if not cap:
-            return {"stopped": None}
+            cap = self.capture
+            if not cap or (session and cap["id"] != session) or cap["stopping"]:
+                return {"stopped": None}
+            cap["stopping"] = True      # renewals are refused from here on
         from .capture import write_session_json
 
-        cap["timer"].cancel()
-        cap["stop_sampling"].set()
-        if cap["touch"]:
-            cap["touch"].stop()
-        meta = {"session": cap["id"], "device_id": self.cfg.device_id,
-                "started_utc": cap["started"], "ended_utc": time.time(),
-                "video": None, "audio": None, "segments": [], "error": None}
-        if cap["av"]:
-            cap["av"].stop()
-            meta.update(cap["av"].metadata())
-        requested = cap["screen"]
-        meta.update(
-            stop_reason=reason, touch=bool(cap["touch"]), settings=cap["settings"],
-            screen={"requested": requested and {
-                        "mode": requested.get("mode", "content"),
-                        "items": [it["name"] for it in requested.get("items") or []]},
-                    "log": cap["screen_log"],
-                    "playback": cap["playback"],
-                    "restored": sorted(cap["restore"])})
-        self._undo_capture_settings(cap)
-        self.uploader.enqueue(write_session_json(self.cfg.spool_dir / cap["id"], meta))
+        try:
+            cap["stop_sampling"].set()
+            if cap["touch"]:
+                cap["touch"].stop()
+            meta = {"session": cap["id"], "device_id": self.cfg.device_id, "agent_version": VERSION,
+                    "started_utc": cap["started"], "ended_utc": time.time(),
+                    "video": None, "audio": None, "segments": [], "error": None}
+            if cap["av"]:
+                cap["av"].stop()
+                meta.update(cap["av"].metadata())
+            requested = cap["screen"]
+            meta.update(
+                stop_reason=reason, touch=bool(cap["touch"]), settings=cap["settings"], request=cap["meta"],
+                screen={"requested": requested and {
+                            "mode": requested.get("mode", "content"),
+                            "items": _names(requested.get("items"))},
+                        "log": cap["screen_log"],
+                        "playback": cap["playback"],
+                        "restored": sorted(cap["restore"])})
+            self._undo_capture_settings(cap)
+            write_session_json(self.cfg.spool_dir / cap["id"], meta)
+        finally:
+            with self.capture_lock:
+                self.capture = None
         self.emit("capture_finished", session=cap["id"], reason=reason)
         return {"stopped": cap["id"], "reason": reason}
 
     # ------------------------------------------------------------ main loop
 
-    async def run(self) -> None:
-        self.loop = asyncio.get_running_loop()
-        self.outbox = asyncio.Queue(maxsize=200)
-        self.status_now = asyncio.Event()
-        self.uploader.start()
+    def _watchdog(self) -> None:
+        """Ends a capture at its duration or when its lease ran out."""
+        with self.capture_lock:
+            cap = self.capture
+            if not cap or cap["stopping"]:
+                return
+            now = time.time()
+            reason = ("lease_expired" if cap["lease_until"] is not None and now > cap["lease_until"]
+                      else "duration" if now >= cap["until"] else None)
+        if reason:
+            self._capture_stop(reason=reason, session=cap["id"])
+
+    def run(self) -> None:
+        from .server import serve
+
+        for sid in self.spool.recover():
+            self.emit("capture_interrupted", session=sid)
         # Undo a screen-off left behind by a previous run (panel off, touch detached from X).
-        await self.loop.run_in_executor(None, system.screen_power, True, self.cfg.touch_device_name)
-        await self.loop.run_in_executor(None, self.player.start)
-
-        ws_url = self.cfg.server_url.replace("http", "ws", 1)
-        url = (f"{ws_url}/ws/device/{urllib.parse.quote(self.cfg.device_id)}"
-               f"?token={urllib.parse.quote(self.cfg.token)}")
-        delay = 1.0
-        while True:
-            try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                    log.info("connected to %s", self.cfg.server_url)
-                    delay = 1.0
-                    await ws.send(json.dumps({"type": "hello", "data": {
-                        "device_id": self.cfg.device_id, "version": VERSION}}))
-                    await self._session(ws)
-            except (OSError, websockets.exceptions.WebSocketException) as e:
-                log.warning("server connection lost: %s", e)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 30.0)
-
-    async def _session(self, ws) -> None:
-        async def sender():
-            while True:
-                await ws.send(json.dumps(await self.outbox.get()))
-
-        async def status_loop():
-            while True:
-                await self.loop.run_in_executor(None, self.player.ensure_running)
-                self.status_now.clear()
-                data = await self.loop.run_in_executor(None, self.status)
-                await ws.send(json.dumps({"type": "status", "data": data}))
+        system.screen_power(True, self.cfg.touch_device_name)
+        self.player.start()
+        httpd = serve(self, self.cfg.listen_host, self.cfg.listen_port)
+        self.emit("agent_started", version=VERSION)
+        next_ensure = 0.0
+        try:
+            while not self.stop_event.wait(0.5):
                 try:
-                    await asyncio.wait_for(self.status_now.wait(), self.cfg.status_interval)
-                except asyncio.TimeoutError:
-                    pass
-
-        async def receiver():
-            async for raw in ws:
-                msg = json.loads(raw)
-                if msg.get("type") == "command":
-                    asyncio.create_task(self._run_command(ws, msg))
-
-        tasks = [asyncio.create_task(t()) for t in (sender, status_loop, receiver)]
-        try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                t.result()
+                    self._watchdog()
+                except Exception:
+                    log.exception("capture watchdog failed")
+                if time.monotonic() >= next_ensure:
+                    next_ensure = time.monotonic() + ENSURE_PLAYER_EVERY_S
+                    try:
+                        self.player.ensure_running()
+                    except Exception:
+                        log.exception("player check failed")
         finally:
-            for t in tasks:
-                t.cancel()
+            httpd.shutdown()
+            self._capture_stop(reason="agent_stopped")
 
-    async def _run_command(self, ws, msg: dict) -> None:
-        cid, cmd, params = msg.get("id"), msg.get("cmd"), msg.get("params") or {}
-        log.info("command %s %s", cmd, params if cmd != "set_playlist" else "...")
-        try:
-            result = await self.loop.run_in_executor(None, self.handle, cmd, params)
-            ack = {"type": "ack", "id": cid, "ok": True, "result": result}
-        except Exception as e:
-            log.exception("command %s failed", cmd)
-            ack = {"type": "ack", "id": cid, "ok": False, "error": f"{type(e).__name__}: {e}"}
-        await ws.send(json.dumps(ack))
-        if cmd not in ("ping", "get_status"):
-            self.push_status()
+
+def _names(items) -> list[str]:
+    """Media names from a list of names or of {"name": ...} dicts."""
+    return [it["name"] if isinstance(it, dict) else str(it) for it in items or []]
+
+
+def _remove_if_empty(folder) -> None:
+    try:
+        folder.rmdir()
+    except OSError:
+        pass
 
 
 def wait_for_display(timeout: float = 120) -> None:

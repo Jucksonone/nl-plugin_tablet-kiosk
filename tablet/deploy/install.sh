@@ -12,7 +12,7 @@ $SUDO apt-get install -y \
     gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
     gstreamer1.0-pipewire gstreamer1.0-gl gstreamer1.0-vaapi \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad v4l-utils \
-    matchbox-window-manager
+    matchbox-window-manager openssh-server
 
 # Backlight writable by the video group; touch device readable by the input group.
 $SUDO install -m 644 $DEPLOY/90-kiosk-backlight.rules /etc/udev/rules.d/
@@ -41,6 +41,6 @@ systemctl --user daemon-reload
 systemctl --user restart pipewire pipewire-pulse wireplumber
 
 echo
-echo "Installed. Edit ~/.config/kiosk/config.toml (server_url, token), then run"
+echo "Installed. Put the plugin's token into ~/.config/kiosk/config.toml, then run"
 echo "  kiosk-mode on     # auto-login into the kiosk session (restarts the display)"
 echo "  kiosk-mode off    # back to the Xubuntu desktop for maintenance"
