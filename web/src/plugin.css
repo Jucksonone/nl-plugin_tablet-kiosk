@@ -1,0 +1,8 @@
+/* Utilities only (AGENTS.md rule 6): no preflight, no :root variables, so this
+   file cannot change the platform page. Colours, radii and fonts are the
+   platform's own tokens (bg-card, text-muted-foreground, rounded-md, …). */
+@import "tailwindcss/theme.css" layer(theme) theme(reference);
+@import "tailwindcss/utilities.css" layer(utilities);
+@import "@natural-land/plugin-sdk/theme.css";
+
+@source "./";
