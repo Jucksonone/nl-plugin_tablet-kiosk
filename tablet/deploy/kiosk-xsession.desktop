@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Kiosk
+Comment=Tablet kiosk agent only, no desktop
+Exec=@SESSION_SCRIPT@
+Type=Application

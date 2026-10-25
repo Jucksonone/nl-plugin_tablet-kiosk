@@ -1,0 +1,14 @@
+# ~/.config/kiosk/config.toml — every key is optional; defaults are in kiosk/config.py
+server_url = "http://192.168.31.215:8000"
+token = "change-me"
+# device_id = "tablet-01"        # defaults to the hostname
+
+# cache_max_bytes = 21474836480  # 20 GiB
+# keep_uploaded = false          # delete local capture files after upload
+
+# Capture (camera supports 640x480, 800x600, 1280x720, 1280x960, 1600x900, ...)
+# width = 640
+# height = 480
+# video_bitrate_kbps = 1000
+# segment_seconds = 10
+# ae_target = 100.0              # mean raw luma 0-255 the auto-exposure aims for

@@ -1,0 +1,11 @@
+[Unit]
+Description=Tablet kiosk agent (player, capture, cloud commands)
+After=pipewire.service wireplumber.service
+
+[Service]
+# DISPLAY / XAUTHORITY are imported by the XDG autostart entry before it starts us.
+Environment=GST_GL_API=gles2 GST_GL_PLATFORM=egl PYTHONUNBUFFERED=1
+WorkingDirectory=%h/kiosk/device
+ExecStart=/usr/bin/python3 -m kiosk
+Restart=always
+RestartSec=5

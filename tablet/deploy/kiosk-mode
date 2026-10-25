@@ -1,0 +1,21 @@
+#!/bin/sh
+# kiosk-mode on|off|status
+#   on   log in automatically to the kiosk session (agent only, no pop-ups)
+#   off  log in to the normal Xubuntu desktop for maintenance (agent not started)
+# Switching restarts the display manager, which ends the current session.
+set -eu
+CONF=/etc/lightdm/lightdm.conf.d/50-autologin.conf
+
+case "${1:-status}" in
+    on) session=kiosk ;;
+    off) session=xubuntu ;;
+    status)
+        if grep -q '^autologin-session=kiosk' "$CONF" 2>/dev/null; then echo on; else echo off; fi
+        exit 0 ;;
+    *) echo "usage: kiosk-mode on|off|status" >&2; exit 2 ;;
+esac
+
+sudo sed -i '/^autologin-session=/d' "$CONF"
+echo "autologin-session=$session" | sudo tee -a "$CONF" >/dev/null
+echo "auto-login session: $session; restarting the display manager..."
+sudo systemctl restart lightdm
