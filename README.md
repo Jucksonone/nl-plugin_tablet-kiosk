@@ -13,5 +13,7 @@ plugin.
 - **Media library**, manual controls and manual captures on the system page.
 - **Read-only Agent tools**.
 
+User manual (Chinese): [`docs/使用手册.md`](docs/使用手册.md).
+
 Development, verification and joining follow [`AGENTS.md`](AGENTS.md); this plugin's notes are at the end
 of it, under "本插件说明".
