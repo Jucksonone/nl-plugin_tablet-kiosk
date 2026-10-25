@@ -127,7 +127,7 @@ def start_upload(body: UploadStart) -> dict:
     ext = Path(body.filename).suffix.lower().lstrip(".")
     if not media_kind(ext):
         raise PluginError(400, "unsupported_type", f"files of type .{ext} cannot be shown on the tablet")
-    if shutil.disk_usage(controller.data_dir.parent if not controller.data_dir.exists() else controller.data_dir).free < body.size * 2:
+    if shutil.disk_usage(controller.data_dir).free < body.size * 2:
         raise PluginError(507, "no_space", "not enough free space on the host for this file")
     upload_id = secrets.token_hex(12)
     d = _upload_dir()

@@ -18,7 +18,8 @@ AUTH = {"authorization": f"Bearer {TOKEN}"}
 
 @pytest.fixture
 def http(monkeypatch, tmp_path):
-    monkeypatch.setattr(plugin, "_settings", Settings(id="tablet_kiosk", token=TOKEN, port=1, data_dir=tmp_path))
+    # the installer does not create the data directory: the plugin does on first use
+    monkeypatch.setattr(plugin, "_settings", Settings(id="tablet_kiosk", token=TOKEN, port=1, data_dir=tmp_path / "data" / "tablet_kiosk"))
     return TestClient(plugin.app)   # no `with`: the lifespan (controller threads) does not start
 
 
@@ -43,3 +44,8 @@ def test_uploads_only_take_media_types(http):
 def test_capture_files_reject_odd_names(http):
     assert http.get("/captures/a/files/..%2Fsecret", headers=AUTH).status_code == 404
     assert http.get("/captures/..%2Fx/files/a.mp4", headers=AUTH).status_code == 404
+
+
+def test_an_upload_starts_without_the_data_directory(http):
+    r = http.post("/media/uploads", json={"filename": "clip.mp4", "size": 10}, headers=AUTH)
+    assert r.status_code == 201 and r.json()["chunk_bytes"] <= 1024 * 1024

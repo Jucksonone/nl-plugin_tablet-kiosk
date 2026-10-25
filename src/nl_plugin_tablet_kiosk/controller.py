@@ -35,6 +35,7 @@ from .model import CaptureDoc, ManualCapture, PlanDoc, SettingsDoc
 from .tablet import Tablet, TabletError
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)   # one line per tablet request (every 2-3 s) otherwise
 
 STATUS_EVERY_S = 2.0
 EVENTS_EVERY_S = 3.0
@@ -156,8 +157,10 @@ class Controller:
 
     @property
     def data_dir(self) -> Path:
-        d = self._data_dir or self.plugin.settings.data_dir or Path("data")
-        return Path(d)
+        """$NL_PLUGIN_DATA_DIR, created on first use (the installer does not create it)."""
+        d = Path(self._data_dir or self.plugin.settings.data_dir or Path("data"))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     @property
     def media_dir(self) -> Path:
@@ -177,7 +180,7 @@ class Controller:
         return self.captures_dir / session_id
 
     def disk(self) -> dict:
-        u = shutil.disk_usage(self.data_dir if self.data_dir.exists() else Path("."))
+        u = shutil.disk_usage(self.data_dir)
         return {"free_bytes": u.free, "total_bytes": u.total, "min_free_bytes": int(self.settings.min_free_gb * 1e9)}
 
     # ------------------------------------------------------------ lifecycle
