@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import store
+from . import store, touches
 from .model import CaptureDoc, ManualCapture, PlanDoc, SettingsDoc
 from .tablet import Tablet, TabletError
 
@@ -622,7 +622,8 @@ class Controller:
                 with self.plugin.connect() as conn:
                     store.add_file(conn, sid, "session.json", (folder / "session.json").stat().st_size)
                     files_now = store.capture_files(conn, sid)
-                    store.finish_capture(conn, sid, meta, summarise(meta, files_now))
+                    summary = {**summarise(meta, files_now), **touches.stats(folder, meta.get("started_utc"))}
+                    store.finish_capture(conn, sid, meta, summary)
                     store.add_event(conn, "capture_stored", session_id=sid, run_id=(meta.get("request") or {}).get("run_id"),
                                     data={"files": len(files_now), "bytes": sum(x["bytes"] for x in files_now),
                                           "stop_reason": meta.get("stop_reason")})

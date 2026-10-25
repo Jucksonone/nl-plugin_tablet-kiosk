@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from natural_land_plugin_sdk import Caller, Plugin, PluginError, ToolError
 
-from . import store
+from . import store, touches
 from .controller import SESSION_ID, Controller, Refused
 from .model import MEDIA_NAME, ManualCapture, PlanDoc, SettingsDoc, media_kind
 
@@ -353,10 +353,23 @@ def list_captures(run_id: str | None = None, experiment_id: int | None = None,
     return {"captures": rows, "total": total}
 
 
+def backfill_touches(conn, c: dict) -> None:
+    """Captures stored before 0.2.0 have no touch count in their summary: add it."""
+    if not c["complete"] or "touches" in (c.get("summary") or {}):
+        return
+    folder = controller.capture_dir(c["session_id"])
+    if not any(folder.glob("touch_*.jsonl")):
+        return
+    extra = touches.stats(folder, (c.get("meta") or {}).get("started_utc"))
+    conn.execute("UPDATE captures SET summary = summary || %s::jsonb WHERE session_id = %s", [json.dumps(extra), c["session_id"]])
+    c["summary"] = {**(c.get("summary") or {}), **extra}
+
+
 @plugin.app.get("/captures/{session_id}")
 def get_capture(session_id: str) -> dict:
     with plugin.connect() as conn:
         c = _capture_or_404(conn, session_id)
+        backfill_touches(conn, c)
         c["media_names"] = store.media_names(conn)
     c["capturing"] = ((controller.report or {}).get("capture") or {}).get("session") == session_id
     return c
@@ -386,6 +399,36 @@ def capture_file(session_id: str, name: str) -> FileResponse:
         raise PluginError(404, "file_not_found", "no such file")
     media = {".mp4": "video/mp4", ".jsonl": "application/x-ndjson", ".json": "application/json"}.get(path.suffix, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=name, content_disposition_type="inline")
+
+
+@plugin.app.get("/captures/{session_id}/touches")
+def capture_touches(session_id: str) -> dict:
+    """The capture's touches joined into contacts (one per finger down), with the screen log for context."""
+    with plugin.connect() as conn:
+        c = _capture_or_404(conn, session_id)
+        names = store.media_names(conn)
+    meta = c.get("meta") or {}
+    folder = controller.capture_dir(session_id)
+    out = touches.contacts(folder, meta.get("started_utc") or (c["started_at"] and datetime.fromisoformat(c["started_at"]).timestamp()))
+    start = out["started"]
+    log = (meta.get("screen") or {}).get("log") or []
+    out["screen"] = [{"t": round(e["t"] - start, 3) if start else None, "mode": e.get("mode"), "file": e.get("file"),
+                      "name": names.get(e.get("file") or "", e.get("file"))} for e in log]
+    segs = meta.get("segments") or []
+    out["segments"] = [{"file": s.get("file"), "t0": round(s["start_utc"] - start, 3) if start and s.get("start_utc") else None,
+                        "t1": round(s["end_utc"] - start, 3) if start and s.get("end_utc") else None} for s in segs]
+    out["duration"] = round(meta["ended_utc"] - start, 3) if start and meta.get("ended_utc") else out["last"]
+    out["complete"] = c["complete"]
+    return out
+
+
+@plugin.app.get("/captures/{session_id}/touch.csv")
+def capture_touch_csv(session_id: str) -> StreamingResponse:
+    with plugin.connect() as conn:
+        c = _capture_or_404(conn, session_id)
+    data = touch_csv(controller.capture_dir(session_id), (c.get("meta") or {}).get("started_utc"))
+    return StreamingResponse(iter([data.encode()]), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="touch_{session_id}.csv"'})
 
 
 EXPORT_README = """采集记录导出 · {session}
@@ -551,6 +594,7 @@ def _brief(c: dict) -> dict:
     return {"session_id": c["session_id"], "kind": c["kind"], "run_id": c["run_id"], "part": c["part"],
             "started_at": c["started_at"], "ended_at": c["ended_at"], "stop_reason": c["stop_reason"],
             "complete": c["complete"], "duration_s": s.get("duration_s"), "segments": s.get("segments"),
+            "touches": s.get("touches"), "touch_seconds": s.get("touch_seconds"),
             "touch_frames": s.get("touch_frames"), "touch_frames_down": s.get("touch_frames_down"),
             "bytes": c.get("bytes"), "error": s.get("error")}
 
@@ -606,6 +650,47 @@ def tool_capture_detail(ctx, session_id: str) -> dict:
             "requested_screen": screen.get("requested"), "files": [{"name": f["name"], "bytes": f["bytes"]} for f in c["files"][:400]],
             "audio_tracks": (meta.get("audio") or {}).get("tracks") if isinstance(meta.get("audio"), dict) else None,
             "video": meta.get("video")}
+
+
+def per_screen(contacts: list[dict], screen: list[dict], duration: float | None) -> list[dict]:
+    """Touches during each entry of the screen log (what was on screen when the finger went down)."""
+    spans = []
+    for i, e in enumerate(screen):
+        t1 = screen[i + 1]["t"] if i + 1 < len(screen) else duration
+        spans.append({"from_s": max(e["t"] or 0, 0), "to_s": t1, "mode": e["mode"], "media": e.get("name") if e["mode"] == "content" else None, "touches": 0})
+    for c in contacts:
+        for sp in spans:
+            if c["t0"] >= sp["from_s"] and (sp["to_s"] is None or c["t0"] < sp["to_s"]):
+                sp["touches"] += 1
+                break
+    return spans
+
+
+@plugin.agent_tool(
+    "tablet_touches",
+    label={"zh-CN": "读取平板触摸", "en": "Reading tablet touches"},
+    description="The touches of one tablet capture: how many (one per finger put down), how many while each screen "
+                "content was shown, and each touch with its start time (seconds from the capture start), duration, "
+                "start and end position (0-1 screen fractions, origin top left) and distance moved.",
+    parameters={"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                                                 "limit": {"type": "integer", "minimum": 0, "maximum": 1000}},
+                "required": ["session_id"], "additionalProperties": False},
+    examples=({"session_id": "nl-verify-run.p1", "limit": 100},),
+)
+def tool_touches(ctx, session_id: str, limit: int = 300) -> dict:
+    with plugin.connect() as conn:
+        c = store.capture(conn, session_id) if SESSION_ID.match(session_id) else None
+    if c is None:
+        raise ToolError("no_data", "no capture with this session id")
+    if c["run_id"]:
+        ctx.require_run(c["run_id"])
+    elif c.get("experiment_id"):
+        ctx.require_experiment(c["experiment_id"])
+    data = capture_touches(session_id)
+    rows = [{k: x[k] for k in ("i", "t0", "duration", "x0", "y0", "x1", "y1", "distance", "fingers")} for x in data["contacts"][:limit]]
+    return {"touches": data["count"], "complete": data["complete"], "capture_seconds": data["duration"],
+            "max_fingers": data["max_fingers"], "per_screen": per_screen(data["contacts"], data["screen"], data["duration"]),
+            "list": rows, "list_truncated": data["count"] > len(rows)}
 
 
 @plugin.agent_tool(
@@ -679,6 +764,12 @@ def forget_deleted() -> None:
         shutil.rmtree(controller.capture_dir(sid), ignore_errors=True)
     if gone_runs or gone_exps:
         logger.info("forgot %d deleted records (%d captures) and %d deleted experiments", len(gone_runs), len(sessions), len(gone_exps))
+    with plugin.connect() as conn:
+        old = [r[0] for r in conn.execute("SELECT session_id FROM captures WHERE complete AND NOT summary ? 'touches' LIMIT 50").fetchall()]
+        for sid in old:
+            c = store.capture(conn, sid)
+            if c:
+                backfill_touches(conn, c)
     # unfinished uploads older than a day
     for meta in _upload_dir().glob("*.json"):
         try:

@@ -1,9 +1,10 @@
 // Capture lists and one capture in detail (files, playback, screen log, export).
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { fileUrl, useActions, useCapture, type Capture, type CaptureDetail } from "./api";
 import { NS } from "./i18n";
+import { TouchPanel } from "./touch";
 import { Badge, ErrorNotice, Notice, Stat, fmtBytes, fmtDuration, fmtTime, pct, useSdk } from "./ui";
 
 export function captureState(c: Capture): { tone: "live" | "ok" | "warn" | "muted"; key: string } {
@@ -24,6 +25,7 @@ export function CaptureTable({ rows, selected, onSelect, showRun }: { rows: Capt
             <th className="py-1 pr-3 font-medium">{t("captures.kind")}</th>
             {showRun ? <th className="py-1 pr-3 font-medium">{t("captures.run")}</th> : null}
             <th className="py-1 pr-3 font-medium">{t("captures.duration")}</th>
+            <th className="py-1 pr-3 font-medium">{t("captures.touches")}</th>
             <th className="py-1 pr-3 font-medium">{t("captures.size")}</th>
             <th className="py-1 pr-3 font-medium">{t("captures.state")}</th>
           </tr>
@@ -44,6 +46,7 @@ export function CaptureTable({ rows, selected, onSelect, showRun }: { rows: Capt
                 </td>
                 {showRun ? <td className="max-w-48 truncate py-1.5 pr-3 font-mono text-xs">{c.run_id ?? "—"}</td> : null}
                 <td className="py-1.5 pr-3 tabular-nums">{fmtDuration(c.summary?.duration_s)}</td>
+                <td className="py-1.5 pr-3 tabular-nums">{c.summary?.touches ?? "—"}</td>
                 <td className="py-1.5 pr-3 tabular-nums">{fmtBytes(c.bytes)}</td>
                 <td className="py-1.5 pr-3">
                   <Badge tone={st.tone}>{t(`captures.states.${st.key}`)}</Badge>
@@ -65,6 +68,13 @@ export function CaptureView({ sessionId, onDeleted }: { sessionId: string; onDel
   const q = useCapture(sdk, sessionId);
   const actions = useActions(sdk);
   const [segment, setSegment] = useState<string | null>(null);
+  const [cursor, setCursor] = useState<number | null>(null);
+  const seekTo = useRef<number | null>(null);
+  const video = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    setSegment(null);
+    setCursor(null);
+  }, [sessionId]);
   if (q.isPending) return <p className="text-sm text-muted-foreground">{t("loading")}</p>;
   if (q.error) return <ErrorNotice error={q.error} />;
   const c: CaptureDetail = q.data;
@@ -74,6 +84,29 @@ export function CaptureView({ sessionId, onDeleted }: { sessionId: string; onDel
   const log = meta.screen?.log ?? [];
   const name = (n: string | null) => (n ? (c.media_names[n] ?? n) : "—");
   const start = meta.started_utc ?? null;
+  // video segments on the capture's own time axis (seconds from its start)
+  const segs = (meta.segments ?? [])
+    .filter((x) => x.file && videos.some((f) => f.name === x.file))
+    .map((x, i, all) => {
+      const t0 = start !== null && x.start_utc !== null ? x.start_utc - start : i * 10;
+      const t1 = start !== null && x.end_utc !== null ? x.end_utc - start : (all[i + 1] && start !== null && all[i + 1].start_utc !== null ? all[i + 1].start_utc! - start : t0 + 10);
+      return { file: x.file, t0, t1 };
+    });
+  const current = segs.find((x) => x.file === segment) ?? null;
+  const play = (file: string, offset: number) => {
+    if (file === segment && video.current) {
+      video.current.currentTime = offset;
+      void video.current.play().catch(() => undefined);
+    } else {
+      seekTo.current = offset;
+      setSegment(file);
+    }
+  };
+  const seek = (s: number) => {
+    const seg = [...segs].reverse().find((x) => x.t0 <= s + 0.001) ?? segs[0];
+    if (seg) play(seg.file, Math.max(0, s - seg.t0));
+  };
+  const hasTouch = c.files.some((f) => f.name.startsWith("touch_"));
   return (
     <div className="space-y-4 rounded-md border border-border p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -100,7 +133,7 @@ export function CaptureView({ sessionId, onDeleted }: { sessionId: string; onDel
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <Stat label={t("captures.duration")} value={fmtDuration(s.duration_s)} hint={`${fmtTime(c.started_at)} → ${c.ended_at ? fmtTime(c.ended_at) : "…"}`} />
         <Stat label={t("captures.segments")} value={s.segments ?? videos.length} hint={fmtBytes(c.bytes)} />
-        <Stat label={t("captures.touchFrames")} value={s.touch_frames ?? "—"} hint={t("captures.touchDown", { n: s.touch_frames_down ?? 0, max: s.max_fingers ?? 0 })} />
+        <Stat label={t("captures.touches")} value={s.touches ?? "—"} hint={t("captures.touchFramesHint", { n: s.touch_frames ?? 0 })} />
         <Stat label={t("captures.levels")} value={`${pct(meta.settings?.volume)} / ${pct(meta.settings?.brightness)}`} hint={t("captures.levelsHint")} />
       </div>
       {videos.length ? (
@@ -108,17 +141,39 @@ export function CaptureView({ sessionId, onDeleted }: { sessionId: string; onDel
           <div className="text-sm font-medium">{t("captures.playback")}</div>
           <div className="flex flex-wrap gap-1">
             {videos.map((f) => (
-              <Button key={f.name} size="xs" variant={segment === f.name ? "default" : "outline"} onClick={() => setSegment(f.name)}>
+              <Button key={f.name} size="xs" variant={segment === f.name ? "default" : "outline"} onClick={() => play(f.name, 0)}>
                 {f.name.replace(/^av_0*/, "").replace(".mp4", "") || "0"}
               </Button>
             ))}
           </div>
           {segment ? (
-            <video key={segment} className="max-h-80 w-full max-w-xl rounded-md bg-black" controls autoPlay src={fileUrl(sdk, `captures/${encodeURIComponent(c.session_id)}/files/${segment}`)} />
+            <video
+              ref={video}
+              key={segment}
+              className="max-h-80 w-full max-w-xl rounded-md bg-black"
+              controls
+              autoPlay
+              src={fileUrl(sdk, `captures/${encodeURIComponent(c.session_id)}/files/${segment}`)}
+              onLoadedMetadata={(e) => {
+                if (seekTo.current !== null) e.currentTarget.currentTime = seekTo.current;
+                seekTo.current = null;
+              }}
+              onTimeUpdate={(e) => current && setCursor(current.t0 + e.currentTarget.currentTime)}
+              onEnded={() => {
+                const next = segs[segs.findIndex((x) => x.file === segment) + 1];
+                if (next) play(next.file, 0);
+              }}
+            />
           ) : (
             <p className="text-xs text-muted-foreground">{t("captures.pickSegment")}</p>
           )}
           {meta.audio?.tracks?.length ? <p className="text-xs text-muted-foreground">{t("captures.tracks", { tracks: meta.audio.tracks.map((x, i) => `${i + 1} ${t(`tracks.${x}`, { defaultValue: x })}`).join(" · ") })}</p> : null}
+        </div>
+      ) : null}
+      {hasTouch ? (
+        <div className="space-y-2">
+          <div className="text-sm font-medium">{t("touch.title")}</div>
+          <TouchPanel sessionId={c.session_id} window={current ? { t0: current.t0, t1: current.t1 } : null} cursor={current ? cursor : null} onSeek={seek} live={!c.complete} />
         </div>
       ) : null}
       <div className="space-y-1">

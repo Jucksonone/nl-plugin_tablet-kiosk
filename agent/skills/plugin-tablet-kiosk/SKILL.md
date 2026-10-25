@@ -30,6 +30,8 @@ white / black / switched-off screen) and can record, at the same time:
   times, why each ended (`stop_reason`), touch frame counts, size, `complete`.
 - `tablet_kiosk__tablet_capture_detail(session_id)` — one capture: files, the screen log (what was on
   screen from when, with the media's original file names), volume and brightness.
+- `tablet_kiosk__tablet_touches(session_id, limit?)` — the touches of one capture: count, touches while each
+  screen content was shown (`per_screen`), and each touch (start, duration, start / end position, distance).
 - `tablet_kiosk__tablet_plan_of_experiment(experiment_id)` — the current plan of an experiment.
 - `tablet_kiosk__tablet_events(run_id?, limit?)` — the event log, newest first.
 
@@ -37,9 +39,10 @@ white / black / switched-off screen) and can record, at the same time:
 
 - Times in captures and screen logs are the **tablet's clock** (Unix seconds); the status gives the
   tablet's clock offset to the host.
-- `touch_frames` counts every multitouch frame, `touch_frames_down` those with at least one finger on
-  the screen. Frames are not touches: one tap is several frames. Do not call them "touches" or "events of
-  the animal" without saying so.
+- `touches` counts contacts: one per finger put down (a tap and a long swipe are one touch each; two
+  fingers at once are two). `touch_frames` counts raw multitouch frames (~40 per second while a finger
+  moves): never report frames as touches. Who touched (animal, person) is not known to the plugin.
+- Positions are fractions of the screen (x right, y down, 0-1); the screen is 16:10.
 - `complete: false` means some files are still on the tablet (being fetched, or the host was low on
   disk): the numbers may grow.
 - `stop_reason`: `record_ended` (normal for record captures), `duration` (manual captures, or a part

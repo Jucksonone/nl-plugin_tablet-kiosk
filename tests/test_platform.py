@@ -164,6 +164,10 @@ def test_the_tablet_follows_a_record_and_files_come_home(env, monkeypatch):
             done = store.capture(conn, f"{RUN}.p1")
             assert done["complete"] and done["stop_reason"] == "record_ended"
             assert done["summary"]["touch_frames"] == 2 and done["summary"]["segments"] == 2
+            assert done["summary"]["touches"] == 1
+            t = http.get(f"/captures/{RUN}.p1/touches", headers=auth).json()   # the plugin's data dir is this test's
+            assert t["count"] == 1 and t["contacts"][0]["x0"] == 0.5 and t["screen"][0]["mode"] == "white"
+            assert http.get(f"/captures/{RUN}.p1/touch.csv", headers=auth).text.startswith("t_unix")
             assert (tmp / "data" / "captures" / f"{RUN}.p1" / "av_00001.mp4").is_file()
             assert agent.spool.sessions() == []
             c._events_at = float("-inf")

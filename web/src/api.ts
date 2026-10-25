@@ -115,6 +115,8 @@ export interface CaptureSummary {
   duration_s?: number | null;
   segments?: number;
   bytes?: number;
+  touches?: number;
+  touch_seconds?: number;
   touch_frames?: number;
   touch_frames_down?: number;
   max_fingers?: number;

@@ -75,3 +75,24 @@ def test_export_zip_streams_files(tmp_path):
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         assert z.read("s/av_00000.mp4") == big.read_bytes()
         assert z.read("s/README.txt").decode() == "说明"
+
+
+def test_touch_frames_join_into_contacts_across_files(tmp_path):
+    from nl_plugin_tablet_kiosk.app import per_screen
+    from nl_plugin_tablet_kiosk.touches import contacts, stats
+
+    def write(name, frames):
+        (tmp_path / name).write_text("".join(json.dumps({"t": t, "touches": [{"id": i, "x": x, "y": y} for i, x, y in f]}) + "\n" for t, f in frames))
+
+    write("touch_00001.jsonl", [(100.0, [(7, 0.1, 0.1)]), (100.1, [(7, 0.2, 0.1), (8, 0.5, 0.5)])])
+    write("touch_00002.jsonl", [(100.2, [(7, 0.3, 0.1)]), (100.3, []), (105.0, [(9, 0.9, 0.9)]), (105.05, [])])
+    out = contacts(tmp_path, started=99.0)
+    assert out["count"] == 3 and out["frames"] == 6 and out["max_fingers"] == 2
+    first, second, third = out["contacts"]
+    assert (first["id"], first["t0"], first["t1"], first["x1"]) == (7, 1.0, 1.3, 0.3)   # continues into the next file; lifted at 1.3
+    assert first["fingers"] == 2 and round(first["distance"], 3) == 0.2
+    assert second["id"] == 8 and second["duration"] == 0.1
+    assert third["t0"] == 6.0
+    assert stats(tmp_path, 99.0) == {"touches": 3, "touch_seconds": 0.45}
+    spans = per_screen(out["contacts"], [{"t": -0.5, "mode": "white", "name": None}, {"t": 5.0, "mode": "content", "name": "a.png"}], 10.0)
+    assert [(s["mode"], s["media"], s["touches"]) for s in spans] == [("white", None, 2), ("content", "a.png", 1)]

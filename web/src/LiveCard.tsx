@@ -7,6 +7,7 @@ import { useTranslation } from "react-i18next";
 import { useMedia, useStatus } from "./api";
 import { mediaLabel } from "./forms";
 import { NS } from "./i18n";
+import { useTouches } from "./touch";
 import { Badge, ErrorNotice, Notice, Root, fmtDuration, pct, useSdk } from "./ui";
 
 /** Slot "live.card": the tablet at a glance while recording. */
@@ -23,6 +24,8 @@ function Body() {
   const sdk = useSdk();
   const q = useStatus(sdk, 3000);
   const { data: media } = useMedia(sdk);
+  const capturing = q.data?.tablet?.capture?.session ?? null;
+  const touches = useTouches(capturing, 10000);
   if (q.error) return <ErrorNotice error={q.error} />;
   if (!q.data) return <p className="text-sm text-muted-foreground">{t("loading")}</p>;
   const s = q.data;
@@ -52,6 +55,12 @@ function Body() {
             {rep.battery?.capacity ? `${rep.battery.capacity}%` : "—"} · {rep.temperature !== null ? `${rep.temperature.toFixed(0)} °C` : "—"}
           </span>
         </div>
+      ) : null}
+      {cap && cap.touch && touches.data ? (
+        <p className="text-sm">
+          {t("live.touches", { n: touches.data.count })}
+          {touches.data.contacts.length ? <span className="ml-2 text-xs text-muted-foreground">{t("live.lastTouch", { t: fmtDuration(touches.data.contacts[touches.data.contacts.length - 1].t0) })}</span> : null}
+        </p>
       ) : null}
       {s.active_run && !s.want ? <p className="text-xs text-muted-foreground">{t("live.noPlan")}</p> : null}
       {s.low_disk ? <Notice tone="warning">{t("live.lowDisk")}</Notice> : null}
