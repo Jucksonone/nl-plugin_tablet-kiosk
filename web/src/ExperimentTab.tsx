@@ -2,79 +2,104 @@ import "./plugin.css";
 import "./i18n";
 
 import type { PluginSlotProps } from "@natural-land/plugin-sdk";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { useCaptures, useMedia, usePlan, useSavePlan, type PlanDoc } from "./api";
+import { CaptureTable, CaptureView } from "./captures";
+import { CaptureFields } from "./forms";
 import { NS } from "./i18n";
+import { Badge, ErrorNotice, Notice, Root, Section, Toggle, fmtTime, useSdk } from "./ui";
 
-interface Note {
-  id: number;
-  text: string;
-  author: string | null;
-  created_at: string;
+/** Slot "experiment.tab": what the tablet does during this experiment's records, and their captures. */
+export default function ExperimentTab({ sdk }: PluginSlotProps) {
+  return (
+    <Root sdk={sdk}>
+      <Body />
+    </Root>
+  );
 }
 
-/** Slot "experiment.tab": the experiment's notes (example — replace with the plugin's page). */
-export default function ExperimentTab({ sdk }: PluginSlotProps) {
+function Body() {
   const { t } = useTranslation(NS);
-  const client = useQueryClient();
-  const backend = sdk.useBackend();
+  const sdk = useSdk();
   const experimentId = sdk.context.experimentId;
-  const [text, setText] = useState("");
-  // Query keys start with the plugin id so they never collide with the platform's.
-  const key = [sdk.pluginId, "notes", experimentId];
-  const notes = useQuery({
-    queryKey: key,
-    queryFn: ({ signal }) => sdk.api<{ notes: Note[] }>(`experiments/${experimentId}/notes`, { signal }),
-    enabled: experimentId !== null && backend.state === "ready",
-  });
-  const add = useMutation({
-    mutationFn: (value: string) => sdk.api(`experiments/${experimentId}/notes`, { method: "POST", body: { text: value } }),
-    onSuccess: () => {
-      setText("");
-      void client.invalidateQueries({ queryKey: key });
-    },
-  });
-  const { Button, Card, CardContent } = sdk.ui;
-
-  if (backend.state !== "ready") {
-    return <p className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">{t("backendDown", { reason: backend.reason ?? backend.state })}</p>;
-  }
+  if (experimentId === null) return <Notice tone="info">{t("plan.noExperiment")}</Notice>;
   return (
-    <Card>
-      <CardContent className="space-y-3 pt-4">
-        <form
-          className="flex gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (text.trim()) add.mutate(text.trim());
-          }}
-        >
-          <input
-            className="min-w-0 flex-1 rounded-md border border-input bg-card px-3 py-1.5 text-sm"
-            value={text}
-            maxLength={2000}
-            placeholder={t("placeholder")}
-            onChange={(event) => setText(event.target.value)}
-          />
-          <Button type="submit" disabled={add.isPending || !text.trim()}>
-            {t("add")}
+    <div className="space-y-4">
+      <PlanEditor experimentId={experimentId} />
+      <ExperimentCaptures experimentId={experimentId} />
+    </div>
+  );
+}
+
+function PlanEditor({ experimentId }: { experimentId: number }) {
+  const { t } = useTranslation(NS);
+  const sdk = useSdk();
+  const { Button } = sdk.ui;
+  const q = usePlan(sdk, experimentId);
+  const { data: media } = useMedia(sdk);
+  const save = useSavePlan(sdk, experimentId);
+  const [doc, setDoc] = useState<PlanDoc | null>(null);
+  const current = q.data?.current ?? null;
+  useEffect(() => {
+    if (q.data && doc === null) setDoc(q.data.current?.doc ?? q.data.default);
+  }, [q.data, doc]);
+  if (q.error) return <ErrorNotice error={q.error} />;
+  if (!doc) return <p className="text-sm text-muted-foreground">{t("loading")}</p>;
+  const saved = current?.doc ?? q.data?.default;
+  const dirty = JSON.stringify(doc) !== JSON.stringify(saved);
+  const nothing = !(doc.video || doc.audio || doc.touch);
+  return (
+    <Section
+      title={t("plan.title")}
+      actions={current ? <span className="text-xs text-muted-foreground">{t("plan.version", { v: current.version_no, who: current.created_by ?? "—", at: fmtTime(current.created_at) })}</span> : <Badge>{t("plan.none")}</Badge>}
+    >
+      <p className="text-sm text-muted-foreground">{t("plan.hint")}</p>
+      <Toggle id="tk-plan-on" checked={doc.enabled} onChange={(enabled) => setDoc({ ...doc, enabled })} label={t("plan.enabled")} />
+      {doc.enabled ? <CaptureFields id="tk-plan" value={doc} onChange={(v) => setDoc({ ...doc, ...v })} media={media?.media} /> : null}
+      {doc.enabled && nothing ? <Notice tone="warning">{t("plan.nothing")}</Notice> : null}
+      <div className="flex items-center gap-2">
+        <Button disabled={!dirty || save.isPending || (doc.enabled && nothing)} onClick={() => save.mutate({ doc, base_version: current?.version_no ?? 0 }, { onSuccess: () => setDoc(null) })}>
+          {t("plan.save")}
+        </Button>
+        {dirty ? (
+          <Button variant="ghost" onClick={() => setDoc(saved ?? null)}>
+            {t("plan.discard")}
           </Button>
-        </form>
-        {add.error ? <p role="alert" className="text-sm text-destructive">{t("failed", { message: add.error.message })}</p> : null}
-        {notes.data?.notes.length === 0 ? <p className="text-sm text-muted-foreground">{t("empty")}</p> : null}
-        <ul className="space-y-2">
-          {notes.data?.notes.map((note) => (
-            <li key={note.id} className="rounded-md border border-border px-3 py-2 text-sm">
-              <p className="whitespace-pre-wrap">{note.text}</p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {note.author ?? "—"} · {new Date(note.created_at).toLocaleString()}
-              </p>
-            </li>
-          ))}
-        </ul>
-      </CardContent>
-    </Card>
+        ) : null}
+      </div>
+      <ErrorNotice error={save.error} />
+      {q.data && q.data.history.length > 1 ? (
+        <details>
+          <summary className="cursor-pointer text-sm text-muted-foreground">{t("plan.history", { n: q.data.history.length })}</summary>
+          <ul className="mt-1 space-y-0.5 text-sm">
+            {q.data.history.map((h) => (
+              <li key={h.id} className="flex gap-3">
+                <span className="w-10 tabular-nums">v{h.version_no}</span>
+                <span className="text-muted-foreground">{fmtTime(h.created_at)}</span>
+                <span>{h.created_by ?? "—"}</span>
+                <span>{h.doc.enabled ? t("plan.on") : t("plan.off")}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </Section>
+  );
+}
+
+function ExperimentCaptures({ experimentId }: { experimentId: number }) {
+  const { t } = useTranslation(NS);
+  const sdk = useSdk();
+  const [selected, setSelected] = useState<string | null>(null);
+  const q = useCaptures(sdk, { limit: 100 });
+  const rows = (q.data?.captures ?? []).filter((c) => c.experiment_id === experimentId);
+  return (
+    <Section title={t("plan.captures")}>
+      <ErrorNotice error={q.error} />
+      <CaptureTable rows={rows} selected={selected} onSelect={setSelected} showRun />
+      {selected ? <CaptureView sessionId={selected} onDeleted={() => setSelected(null)} /> : null}
+    </Section>
   );
 }

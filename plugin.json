@@ -8,13 +8,19 @@
   "ui": {
     "remote": "nl_plugin_tablet_kiosk",
     "contributions": [
-      { "slot": "experiment.tab", "module": "./ExperimentTab", "title": { "zh-CN": "平板终端", "en": "Tablet kiosk" } }
+      { "slot": "system.page", "module": "./SystemPage", "title": { "zh-CN": "平板终端", "en": "Tablet kiosk" } },
+      { "slot": "experiment.tab", "module": "./ExperimentTab", "title": { "zh-CN": "平板终端", "en": "Tablet kiosk" } },
+      { "slot": "record.tab", "module": "./RecordTab", "title": { "zh-CN": "平板采集", "en": "Tablet captures" } },
+      { "slot": "live.card", "module": "./LiveCard", "title": { "zh-CN": "平板终端", "en": "Tablet kiosk" } }
     ]
   },
   "database": { "schema": "plugin_tablet_kiosk" },
   "mqtt": { "publish": [], "subscribe": [] },
   "agent": {
-    "summary": { "zh-CN": "平板终端（模板示例：实验笔记）", "en": "Tablet kiosk (template example: experiment notes)" },
+    "summary": {
+      "zh-CN": "平板终端：一台 Linux 平板全屏显示刺激素材，并采集摄像头视频、三条麦克风音轨和触摸；可查看平板现在的状态、每个实验的平板方案，以及每条记录的平板采集（时间、屏幕显示记录、触摸次数）",
+      "en": "Tablet kiosk: a Linux tablet shows stimulus media full screen and records camera video, three microphone tracks and touches; its state now, each experiment's tablet plan, and the tablet captures of each record (times, screen log, touch counts)"
+    },
     "skills": "agent/skills"
   }
 }
