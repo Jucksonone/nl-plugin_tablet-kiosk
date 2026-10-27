@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Kiosk agent
+Comment=Start the tablet kiosk agent in the normal desktop session too (the kiosk session starts it itself)
+Exec=sh -c "systemctl --user import-environment DISPLAY XAUTHORITY; systemctl --user restart kiosk-agent.service"
+OnlyShowIn=XFCE;
+X-GNOME-Autostart-enabled=true

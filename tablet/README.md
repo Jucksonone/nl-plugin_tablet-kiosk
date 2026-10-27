@@ -21,7 +21,7 @@ Then on the tablet:
 1. Put the plugin's token into `~/.config/kiosk/config.toml` (the plugin's settings page shows the two
    lines to copy: `token`, `listen_port`).
 2. `kiosk-mode on` (kiosk session, no desktop pop-ups) or, while setting up,
-   `systemctl --user restart kiosk-agent` inside the normal desktop session.
+   the normal desktop session, where an autostart entry starts the agent as well.
 3. `hostname -I` gives the address to enter on the plugin's settings page.
 
 An update is the `rsync` line followed by `systemctl --user restart kiosk-agent` (a running capture is

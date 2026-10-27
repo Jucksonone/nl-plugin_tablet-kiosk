@@ -25,9 +25,10 @@ mkdir -p ~/.config/kiosk ~/.config/pipewire/pipewire.conf.d ~/.config/systemd/us
 cp $DEPLOY/60-echo-cancel.conf ~/.config/pipewire/pipewire.conf.d/
 cp $DEPLOY/kiosk-agent.service ~/.config/systemd/user/
 
-# Kiosk session: the agent is started by the session itself, not by the desktop,
-# so the Xubuntu desktop stays usable for maintenance (`kiosk-mode off`).
-rm -f ~/.config/autostart/kiosk-agent.desktop
+# The kiosk session starts the agent itself; the Xubuntu desktop (`kiosk-mode off`)
+# starts it from an autostart entry, so the tablet is back online after a reboot either way.
+mkdir -p ~/.config/autostart
+cp $DEPLOY/kiosk-agent.desktop ~/.config/autostart/
 chmod +x $DEPLOY/kiosk-session.sh
 sed "s|@SESSION_SCRIPT@|$PWD/$DEPLOY/kiosk-session.sh|" $DEPLOY/kiosk-xsession.desktop > /tmp/kiosk.desktop
 $SUDO install -m 644 /tmp/kiosk.desktop /usr/share/xsessions/kiosk.desktop
